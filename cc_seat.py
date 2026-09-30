@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 VERSION = "0.3.0"
@@ -191,7 +192,7 @@ class Seat:
             pass
         return data or None
 
-    def poll_limit(self, cursor: int) -> tuple[int, dict | None]:
+    def poll_limit(self, cursor: int, session_id: str | None = None) -> tuple[int, dict | None]:
         return cursor, None
 
     def log_cursor(self) -> int:
@@ -547,11 +548,55 @@ class CodexSeat(Seat):
                 if index < len(argv) and not argv[index].startswith("-"):
                     index += 1
                 continue
+            if argv[index] == "--last" and session_id:
+                index += 1
+                continue
             kept.append(argv[index])
             index += 1
         if session_id:
             return ["resume", session_id, *kept]
         return kept
+
+    def resume_thread_id(self, thread_id: str) -> str:
+        """Resolve a subagent's limit to the user session that owns it."""
+        state_path = self.auth_path.parent / "state_5.sqlite"
+        if not state_path.exists():
+            return thread_id
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True, timeout=0.2)
+            seen: set[str] = set()
+            while thread_id and thread_id not in seen:
+                seen.add(thread_id)
+                row = conn.execute(
+                    "SELECT source, rollout_path FROM threads WHERE id = ?", (thread_id,),
+                ).fetchone()
+                if not row:
+                    return ""
+                source, rollout_path = row
+                if source and source.startswith("{"):
+                    source = json.loads(source)
+                if not isinstance(source, dict) or "subagent" not in source:
+                    return thread_id
+                with Path(rollout_path).open() as fh:
+                    metadata = json.loads(fh.readline())
+                if not isinstance(metadata, dict):
+                    return ""
+                payload = metadata.get("payload") or {}
+                if not isinstance(payload, dict):
+                    return ""
+                if metadata.get("type") != "session_meta" or payload.get("id") != thread_id:
+                    return ""
+                parent = payload.get("parent_thread_id") or payload.get("session_id")
+                if not isinstance(parent, str):
+                    return ""
+                thread_id = parent
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            return ""
+        finally:
+            if conn is not None:
+                conn.close()
+        return ""
 
     def log_cursor(self) -> int:
         if not self.log_path.exists():
@@ -564,7 +609,7 @@ class CodexSeat(Seat):
             return 0
         return int(row[0] if row else 0)
 
-    def poll_limit(self, cursor: int) -> tuple[int, dict | None]:
+    def poll_limit(self, cursor: int, session_id: str | None = None) -> tuple[int, dict | None]:
         if not self.log_path.exists():
             return cursor, None
         try:
@@ -581,7 +626,9 @@ class CodexSeat(Seat):
             cursor = int(row_id)
             text = (body or "").lower()
             if any(phrase in text for phrase in CODEX_LIMIT_PHRASES):
-                hit = {"session_id": thread_id or "", "error": "rate_limit"}
+                resume_id = self.resume_thread_id(thread_id or "") if thread_id else ""
+                if resume_id and (session_id is None or resume_id == session_id):
+                    hit = {"session_id": resume_id, "error": "rate_limit"}
         return cursor, hit
 
 
@@ -827,12 +874,20 @@ def cmd_wrap(harness_name: str, argv: list[str]) -> None:
 
     while True:
         cursor = seat.log_cursor()
+        resume_id = None
+        if seat.name == "codex" and "resume" in argv:
+            index = argv.index("resume") + 1
+            if index < len(argv):
+                try:
+                    resume_id = str(uuid.UUID(argv[index]))
+                except ValueError:
+                    pass
         child = subprocess.Popen([binary, *argv], env=env)
         session_id = None
         while child.poll() is None:
             data = seat.read_signal(pid)
             if data is None:
-                cursor, data = seat.poll_limit(cursor)
+                cursor, data = seat.poll_limit(cursor, resume_id)
             if not data:
                 time.sleep(0.25)
                 continue
@@ -840,7 +895,7 @@ def cmd_wrap(harness_name: str, argv: list[str]) -> None:
             found = str(data.get("session_id") or "")
             if not seat.other(current):
                 _info("rate limit with one saved seat — not switching")
-            elif seat.name != "codex" and not found:
+            elif not found:
                 _info("rate limit signal had no session id — not switching")
             else:
                 session_id = found

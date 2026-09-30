@@ -355,8 +355,39 @@ class OtherHarnessTests(unittest.TestCase):
         conn.close()
 
     def test_codex_usage_limit_resumes_that_thread_on_the_other_seat(self) -> None:
+        self._check_codex_usage_limit_resume("thread-9")
+
+    def test_codex_guardian_limit_resumes_parent_on_the_other_seat(self) -> None:
+        self._check_codex_usage_limit_resume("guardian-9")
+
+    def test_codex_explicit_resume_ignores_other_sessions_limit(self) -> None:
+        parent_id = "01a0e98c-4ed5-78e3-962f-7aacac15277c"
+        self._check_codex_usage_limit_resume(
+            "guardian-9", parent_id, ["resume", parent_id, "--model", "gpt-5"],
+        )
+
+    def test_codex_switch_replaces_last_with_parent_id(self) -> None:
+        got = cc_seat.CodexSeat().resume_argv(["resume", "--last", "--model", "gpt-5"], "parent")
+        self.assertEqual(got, ["resume", "parent", "--model", "gpt-5"])
+
+    def _check_codex_usage_limit_resume(
+        self, limited_thread: str, parent_id: str = "thread-9", initial_argv: list[str] | None = None,
+    ) -> None:
         codex = self.home / ".codex"
         codex.mkdir()
+        import sqlite3
+
+        with sqlite3.connect(codex / "state_5.sqlite") as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, rollout_path TEXT)")
+            conn.executemany("INSERT INTO threads VALUES (?, 'cli', '')", [(parent_id,), ("other",)])
+            rollout = codex / "guardian.jsonl"
+            rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+                "id": "guardian-9", "parent_thread_id": parent_id,
+                "session_id": parent_id, "source": {"subagent": {"other": "guardian"}},
+            }}) + "\n")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (
+                "guardian-9", '{"subagent":{"other":"guardian"}}', str(rollout),
+            ))
         auth = codex / "auth.json"
 
         def write(email: str, token: str) -> None:
@@ -384,11 +415,16 @@ class OtherHarnessTests(unittest.TestCase):
             "log = Path(os.environ['SEAT_ARGV_LOG'])\n"
             "with log.open('a') as fh:\n"
             "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-            "if sys.argv[1:2] == ['resume']:\n"
+            "if len(log.read_text().splitlines()) > 1:\n"
+            "    if sys.argv[2:3] == ['guardian-9']:\n"
+            "        print('thread/resume failed: cannot resume a live Guardian reviewer', file=sys.stderr)\n"
+            "        raise SystemExit(1)\n"
             "    raise SystemExit(0)\n"
             "conn = sqlite3.connect(os.environ['SEAT_LOG_DB'])\n"
             "conn.execute('CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, thread_id TEXT, feedback_log_body TEXT)')\n"
-            "conn.execute(\"INSERT INTO logs (thread_id, feedback_log_body) VALUES ('thread-9', 'hit your usage limit')\")\n"
+            f"conn.execute(\"INSERT INTO logs (thread_id, feedback_log_body) VALUES ('{limited_thread}', 'hit your usage limit')\")\n"
+            "if sys.argv[1:2] == ['resume']:\n"
+            "    conn.execute(\"INSERT INTO logs (thread_id, feedback_log_body) VALUES ('other', 'hit your usage limit')\")\n"
             "conn.commit()\n"
             "conn.close()\n"
             "try:\n"
@@ -403,17 +439,84 @@ class OtherHarnessTests(unittest.TestCase):
         os.environ["SEAT_LOG_DB"] = str(db)
         try:
             with self.assertRaises(SystemExit) as caught:
-                cc_seat.cmd_wrap("codex", [])
+                cc_seat.cmd_wrap("codex", initial_argv or [])
         finally:
             signal.signal(signal.SIGINT, previous[0])
             signal.signal(signal.SIGTERM, previous[1])
         self.assertEqual(caught.exception.code, 0)
         launched = [json.loads(line) for line in argv_log.read_text().splitlines()]
-        self.assertEqual(launched, [[], ["resume", "thread-9"]])
+        self.assertEqual(launched, [initial_argv or [], initial_argv or ["resume", parent_id]])
         live = json.loads(auth.read_text())
         self.assertEqual(live["tokens"]["refresh_token"], "ca")
         left = json.loads((codex / "accounts" / "slots" / "b@example.com" / "auth.json").read_text())
         self.assertEqual(left["tokens"]["refresh_token"], "cb-live")
+
+    def test_codex_limit_without_thread_does_not_restart_as_new_session(self) -> None:
+        import sqlite3
+
+        codex = self.home / ".codex"
+        codex.mkdir()
+        with sqlite3.connect(codex / "logs_2.sqlite") as conn:
+            conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT, feedback_log_body TEXT)")
+            conn.execute("INSERT INTO logs VALUES (1, NULL, 'hit your usage limit')")
+        cursor, hit = cc_seat.CodexSeat().poll_limit(0)
+        self.assertEqual(cursor, 1)
+        self.assertIsNone(hit)
+
+    def test_codex_limit_resolves_nested_child_and_ignores_other_session(self) -> None:
+        import sqlite3
+
+        codex = self.home / ".codex"
+        codex.mkdir()
+        with sqlite3.connect(codex / "state_5.sqlite") as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, rollout_path TEXT)")
+            conn.executemany("INSERT INTO threads VALUES (?, 'cli', '')", [("parent",), ("other",)])
+            for child, parent in [("guardian", "worker"), ("worker", "parent")]:
+                rollout = codex / f"{child}.jsonl"
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+                    "id": child, "parent_thread_id": parent,
+                    "source": {"subagent": {"other": "guardian"}},
+                }}) + "\n")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (
+                    child, '{"subagent":{"other":"guardian"}}', str(rollout),
+                ))
+        with sqlite3.connect(codex / "logs_2.sqlite") as conn:
+            conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT, feedback_log_body TEXT)")
+            conn.executemany("INSERT INTO logs VALUES (?, ?, 'hit your usage limit')", [
+                (1, "guardian"), (2, "other"),
+            ])
+        cursor, hit = cc_seat.CodexSeat().poll_limit(0, "parent")
+        self.assertEqual(cursor, 2)
+        self.assertEqual(hit["session_id"], "parent")
+
+    def test_codex_guardian_without_valid_parent_is_not_resumed(self) -> None:
+        import sqlite3
+
+        codex = self.home / ".codex"
+        codex.mkdir()
+        rollout = codex / "guardian.jsonl"
+        with sqlite3.connect(codex / "state_5.sqlite") as conn:
+            conn.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, rollout_path TEXT)")
+            conn.execute("INSERT INTO threads VALUES (?, ?, ?)", (
+                "guardian", '{"subagent":{"other":"guardian"}}', str(rollout),
+            ))
+        with sqlite3.connect(codex / "logs_2.sqlite") as conn:
+            conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT, feedback_log_body TEXT)")
+            conn.execute("INSERT INTO logs VALUES (1, 'guardian', 'hit your usage limit')")
+        for parent in [None, "guardian"]:
+            with self.subTest(parent=parent):
+                rollout.write_text(json.dumps({"type": "session_meta", "payload": {
+                    "id": "guardian", "parent_thread_id": parent,
+                }}) + "\n")
+                cursor, hit = cc_seat.CodexSeat().poll_limit(0)
+                self.assertEqual(cursor, 1)
+                self.assertIsNone(hit)
+        for contents in ["incomplete JSON", "[]", '{"type":"session_meta","payload":[1]}']:
+            with self.subTest(contents=contents):
+                rollout.write_text(contents)
+                self.assertIsNone(cc_seat.CodexSeat().poll_limit(0)[1])
+        rollout.unlink()
+        self.assertIsNone(cc_seat.CodexSeat().poll_limit(0)[1])
 
     def test_grok_limit_uses_session_id_field_and_resumes(self) -> None:
         grok = self.home / ".grok"
