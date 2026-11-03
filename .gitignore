@@ -11,3 +11,6 @@ slots/
 runtime/
 state.json
 .lock
+
+# local tool session output
+.skylls_cache/
