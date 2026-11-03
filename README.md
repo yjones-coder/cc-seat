@@ -60,7 +60,7 @@ Files are mode `0600`. Directories are mode `0700`. Codex `.credentials.json` is
 
 Grok runs a hook inside the wrapped process. The hook writes `signal-<pid>.json`. The wrapper sees that file, stops the process, refreshes the seat, and starts again with `--resume <session id>`. The same hook exists for Claude and switches only when a second Claude login is saved.
 
-Codex has no such hook. The wrapper reads new rows from `~/.codex/logs_2.sqlite` by log id. It does not scan the whole database. A row that says the usage limit was hit starts the same switch. The next process is `codex resume <thread id>`.
+Codex has no such hook. The wrapper reads new rows from `~/.codex/logs_2.sqlite` by log id. It does not scan the whole database. A row that says the usage limit was hit starts the same switch. For a subagent or Guardian reviewer, it reads the thread metadata and follows the parent IDs to the user session. The next process is `codex resume <parent thread id>`. It skips limits without a valid resume target. When started with `codex-seat resume <session UUID>`, it also ignores limits from other sessions. A fresh launch or the resume picker has no explicit session ID for this filter.
 
 A second limit within 20 seconds stops the loop.
 
